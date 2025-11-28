@@ -1,3 +1,4 @@
+import json
 from typing import Optional, Any, Sequence, List
 from dataclasses import dataclass
 import os
@@ -10,12 +11,14 @@ import torch.distributed as dist
 from torch import nn
 from torch.utils.data import DataLoader
 
+import torchinfo
 import tqdm
 import wandb
 import coolname
 import hydra
 import pydantic
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
+
 from adam_atan2 import AdamATan2
 
 from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
@@ -25,7 +28,7 @@ from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 
 class LossConfig(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra='allow')
-    
+
     name: str
 
 
@@ -60,6 +63,7 @@ class PretrainConfig(pydantic.BaseModel):
 
     # Names
     project_name: Optional[str] = None
+    group_name: Optional[str] = None
     run_name: Optional[str] = None
     checkpoint_path: Optional[str] = None
 
@@ -89,7 +93,7 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
 
         rank=rank,
         num_replicas=world_size,
-        
+
         **kwargs
     ), split=split)
     dataloader = DataLoader(
@@ -137,7 +141,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     optimizers = [
         CastedSparseEmbeddingSignSGD_Distributed(
             model.model.puzzle_emb.buffers(),  # type: ignore
-            
+
             lr=0,  # Needs to be set by scheduler
             weight_decay=config.puzzle_emb_weight_decay,
 
@@ -169,12 +173,19 @@ def cosine_schedule_with_warmup_lr_lambda(
     return base_lr * (min_ratio + max(0.0, (1 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress))))
 
 
-def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, world_size: int):
+def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, world_size: int, verbose=True) -> TrainState:
     # Estimated total training steps
     total_steps = int(config.epochs * train_metadata.total_groups * train_metadata.mean_puzzle_examples / config.global_batch_size)
 
     # Model
     model, optimizers, optimizer_lrs = create_model(config, train_metadata, world_size=world_size)
+
+    if verbose:
+        print(f"Total training steps: {total_steps}")
+        print(f"Model parameters: {sum(p.numel() for p in model.parameters())}")
+        print(f"Optimizers: {optimizers}")
+        print(f"Optimizer learning rates: {optimizer_lrs}")
+        print(torchinfo.summary(model, depth=3))
 
     return TrainState(
         step=0,
@@ -229,15 +240,15 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         for param in train_state.model.parameters():
             if param.grad is not None:
                 dist.all_reduce(param.grad)
-            
+
     # Apply optimizer
-    lr_this_step = None    
+    lr_this_step = None
     for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):
         lr_this_step = compute_lr(base_lr, config, train_state)
 
         for param_group in optim.param_groups:
             param_group['lr'] = lr_this_step
-            
+
         optim.step()
         optim.zero_grad()
 
@@ -254,7 +265,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         if rank == 0:
             metric_values = metric_values.cpu().numpy()
             reduced_metrics = {k: metric_values[i] for i, k in enumerate(metric_keys)}
-            
+
             # Postprocess
             count = max(reduced_metrics["count"], 1)  # Avoid NaNs
             reduced_metrics = {f"train/{k}": v / (global_batch_size if k.endswith("loss") else count) for k, v in reduced_metrics.items()}
@@ -266,13 +277,13 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
 def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch.utils.data.DataLoader, eval_metadata: PuzzleDatasetMetadata, rank: int, world_size: int):
     with torch.inference_mode():
         set_ids = {k: idx for idx, k in enumerate(eval_metadata.sets)}
-        
+
         all_preds = {}
 
         metric_keys = []
         metric_values = None
         metric_global_batch_size = [0 for _ in range(len(set_ids))]
-        
+
         carry = None
         for set_name, batch, global_batch_size in eval_loader:
             # To device
@@ -283,7 +294,7 @@ def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch
             # Forward
             while True:
                 carry, _, metrics, preds, all_finish = train_state.model(carry=carry, batch=batch, return_keys=config.eval_save_outputs)
-                
+
                 if all_finish:
                     break
 
@@ -292,16 +303,16 @@ def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch
                     if k in config.eval_save_outputs:
                         all_preds.setdefault(k, [])
                         all_preds[k].append(v.cpu())  # Move to CPU for saving GPU memory
-                        
+
             del carry, preds, batch, all_finish
 
             # Aggregate
             set_id = set_ids[set_name]
-            
+
             if metric_values is None:
                 metric_keys = list(sorted(metrics.keys()))  # Sort keys to guarantee all processes use the same order.
                 metric_values = torch.zeros((len(set_ids), len(metrics.values())), dtype=torch.float32, device="cuda")
-                
+
             metric_values[set_id] += torch.stack([metrics[k] for k in metric_keys])
             metric_global_batch_size[set_id] += global_batch_size
 
@@ -316,12 +327,12 @@ def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch
         if metric_values is not None:
             if world_size > 1:
                 dist.reduce(metric_values, dst=0)
-            
+
             if rank == 0:
                 reduced_metrics = metric_values.cpu().numpy()
                 reduced_metrics = {set_name: {metric_name: reduced_metrics[set_id, metric_id] for metric_id, metric_name in enumerate(metric_keys)}
                                    for set_id, set_name in enumerate(set_ids)}
-                
+
                 # Postprocess
                 for set_name, metrics in reduced_metrics.items():
                     count = metrics.pop("count")
@@ -361,11 +372,29 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> 
     if rank == 0:
         config = PretrainConfig(**hydra_config)  # type: ignore
 
+        dataset_name = os.path.basename(config.data_path).capitalize()
+        model_arch_name = config.arch.name.split('@')[-1]
         # Naming
         if config.project_name is None:
-            config.project_name = f"{os.path.basename(config.data_path).capitalize()} ACT-torch"
+            config.project_name = f"Abstractor-HRM--{dataset_name}"
+        if config.group_name is None:
+            config.group_name = model_arch_name
+
+        # additional config adjustments for Abstractor-HRM
+        if getattr(config.arch, 'use_abstractor', False):
+            # add symbol retrieval info to group name
+            config.group_name += f'-{config.arch.symbol_config.symbol_retrieval}'
+            if getattr(getattr(config.arch, 'symbol_retrieval_kwargs', {}), 'n_symbols', None) is not None:
+                config.group_name += f"_nsyms{config.arch.symbol_retrieval_kwargs.n_symbols}"
+            if getattr(getattr(config.arch, 'ra_kwargs', {}), 'n_relations', None) is not None:
+                config.group_name += f"_nrel{config.arch.ra_kwargs.n_relations}"
+            if config.arch.rel_attn_type != 'relational_attention':
+                config.group_name += f"_{config.arch.rel_attn_type}"
+            if config.arch.dual_attn_share_attn_weights:
+                config.group_name += "_sharedAttn"
+
         if config.run_name is None:
-            config.run_name = f"{config.arch.name.split('@')[-1]} {coolname.generate_slug(2)}"
+            config.run_name = f"{config.group_name} {coolname.generate_slug(2)}"
         if config.checkpoint_path is None:
             config.checkpoint_path = os.path.join("checkpoints", config.project_name, config.run_name)
 
@@ -391,9 +420,35 @@ def launch(hydra_config: DictConfig):
         WORLD_SIZE = dist.get_world_size()
 
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-        
+
     # Load sync'ed config
     config = load_synced_config(hydra_config, rank=RANK, world_size=WORLD_SIZE)
+    # display config
+    if RANK == 0:
+        print('-'*80)
+        print("Config:")
+        print(OmegaConf.to_yaml(hydra_config))
+        print('-'*80)
+
+        # Print GPU information
+
+        print("CUDA available:", torch.cuda.is_available())
+        # TODO: place this into utility module
+        if torch.cuda.is_available():
+            n_gpus = torch.cuda.device_count()
+            print(f"CUDA devices: {n_gpus}")
+            for i in range(n_gpus):
+                props = torch.cuda.get_device_properties(i)
+                print(f"GPU {i}: {props.name} (capability {props.major}.{props.minor})")
+                print(f"  Total memory: {props.total_memory / (1024**3):.2f} GB")
+                try:
+                    print(f"  Allocated: {torch.cuda.memory_allocated(i) / (1024**3):.3f} GB")
+                    print(f"  Reserved:  {torch.cuda.memory_reserved(i) / (1024**3):.3f} GB")
+                    print(f"  Max alloc: {torch.cuda.max_memory_allocated(i) / (1024**3):.3f} GB")
+                except Exception:
+                    pass
+        else:
+            print("No CUDA GPUs detected.")
 
     # Seed RNGs to ensure consistency
     torch.random.manual_seed(config.seed + RANK)
@@ -415,7 +470,9 @@ def launch(hydra_config: DictConfig):
     if RANK == 0:
         progress_bar = tqdm.tqdm(total=train_state.total_steps)
 
-        wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
+        wandb.init(
+            project=config.project_name, group=config.group_name, name=config.run_name,
+            config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
         wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
         save_code_and_config(config)
 
@@ -438,7 +495,7 @@ def launch(hydra_config: DictConfig):
 
         if RANK == 0 and metrics is not None:
             wandb.log(metrics, step=train_state.step)
-            
+
         ############ Checkpointing
         if RANK == 0 and (config.checkpoint_every_eval or (_iter_id == total_iters - 1)):
             save_train_state(config, train_state)
