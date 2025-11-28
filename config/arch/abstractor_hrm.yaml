@@ -1,0 +1,36 @@
+name: hrm.abstractor_hrm@AbstractorHierarchicalReasoningModel_ACTV1
+loss:
+  name: losses@ACTLossHead
+  loss_type: stablemax_cross_entropy
+
+halt_exploration_prob: 0.1
+halt_max_steps: 16
+
+use_abstractor: true
+dual_attn_share_attn_weights: false
+rel_head_proportion: 0.5
+rel_attn_type: 'relational_attention' # 'relational_attention' or 'rca' or 'disrca'
+sa_kwargs: null
+ra_kwargs: null
+symbol_config:
+  symbol_retrieval: 'symbolic_attention'  # 'symbolic_attention' or 'key_value_memory'
+  symbol_retrieval_kwargs:
+    n_symbols: 128 # Number of symbols in the symbol library (FIXME; how to choose?)
+    d_model: null # Dimension of each symbol (defaults to hidden_size if null)
+    n_heads: 4 # Number of heads for symbolic attention (FIXME; how to choose?)
+  shared_symbol_retriever: false
+  weight_tie_symbol_library: false
+
+H_cycles: 2
+L_cycles: 2
+
+H_layers: 4
+L_layers: 4
+
+hidden_size: 512
+num_heads: 8
+expansion: 4
+
+puzzle_emb_ndim: ${.hidden_size}
+
+pos_encodings: rope
